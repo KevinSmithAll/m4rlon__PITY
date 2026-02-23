@@ -54,15 +54,18 @@ class MessengerUI:
         # Текущий выбранный собеседник
         self.active_chat: str | None = None
 
-        # История сообщений по диалогам: key=frozenset({me, other}) -> list[tuple(sender,text)]
+        # История сообщений по диалогам: key=frozenset({me, other}) -> list[(sender,text)]
         self.history: dict[frozenset[str], list[tuple[str, str]]] = {}
+
+        # Непрочитанные: {"Bob": 2, ...}
+        self.unread: dict[str, int] = {}
 
         if tb:
             self.root = tb.Window(themename="flatly")
         else:
             self.root = tk.Tk()
 
-        self.root.title("Socket Messenger (DM)")
+        self.root.title("Socket Messenger (DM + Unread)")
         self.root.geometry("920x580")
         self.root.minsize(780, 480)
 
@@ -89,7 +92,7 @@ class MessengerUI:
         tk.Label(form, text="Порт:").grid(
             row=2, column=0, sticky="e", padx=8, pady=8)
 
-        self.name_var = tk.StringVar(value="User")
+        self.name_var = tk.StringVar(value="Alice")
         self.host_var = tk.StringVar(value="127.0.0.1")
         self.port_var = tk.StringVar(value="5050")
 
@@ -126,7 +129,7 @@ class MessengerUI:
             "status",), show="tree headings", height=18)
         self.contacts_view.heading("#0", text="Имя")
         self.contacts_view.heading("status", text="Статус")
-        self.contacts_view.column("#0", width=160, anchor="w")
+        self.contacts_view.column("#0", width=170, anchor="w")
         self.contacts_view.column("status", width=80, anchor="center")
         self.contacts_view.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -147,7 +150,7 @@ class MessengerUI:
             header, text=f"Вы: {self.username}", fg="#666")
         self.status_lbl.pack(side="right", padx=12)
 
-        # messages (scrollable) using Text for simplicity
+        # messages area
         self.chat_frame = tk.Frame(self.right)
         self.chat_frame.pack(fill="both", expand=True)
 
@@ -202,25 +205,37 @@ class MessengerUI:
         self.chat_text.see("end")
         self.chat_text.configure(state="disabled")
 
-    # ---------- contacts rendering ----------
+    # ---------- contacts ----------
     def _render_contacts(self):
         for item in self.contacts_view.get_children():
             self.contacts_view.delete(item)
 
         for name in self.contacts:
             if name == self.username:
-                continue  # себя не показываем в контактах
+                continue
+
             status = "online" if name in self.online else "offline"
+            cnt = self.unread.get(name, 0)
+
+            label = name if cnt <= 0 else f"{name} ({cnt})"
+            # iid = чистое имя (без (n)), чтобы selection() возвращал ник
             self.contacts_view.insert(
-                "", "end", iid=name, text=name, values=(status,))
+                "", "end", iid=name, text=label, values=(status,))
 
     def _on_contact_select(self, event):
         sel = self.contacts_view.selection()
         if not sel:
             return
         other = sel[0]
+
         self.active_chat = other
         self.title_lbl.config(text=f"Диалог: {other}")
+
+        # сброс непрочитанных при открытии диалога
+        if self.unread.get(other, 0) > 0:
+            self.unread[other] = 0
+            self._render_contacts()
+
         self._render_active_dialog()
         self.entry.focus_set()
 
@@ -229,6 +244,7 @@ class MessengerUI:
         self.err_label.config(text="")
         name = self.name_var.get().strip()
         host = self.host_var.get().strip()
+
         try:
             port = int(self.port_var.get().strip())
         except ValueError:
@@ -252,6 +268,7 @@ class MessengerUI:
         self.username = name
 
         self._build_main()
+        self.status_lbl.config(text=f"Вы: {self.username}")
 
         threading.Thread(target=self._recv_loop, daemon=True).start()
         threading.Thread(target=self._ping_loop, daemon=True).start()
@@ -293,6 +310,12 @@ class MessengerUI:
         if t == "contacts":
             self.contacts = list(pkt.get("contacts", []))
             self.online = set(pkt.get("online", []))
+
+            # гарантируем ключи unread под контакты
+            for c in self.contacts:
+                if c != self.username:
+                    self.unread.setdefault(c, 0)
+
             self._render_contacts()
 
         elif t == "presence":
@@ -310,7 +333,6 @@ class MessengerUI:
             to = str(pkt.get("to", ""))
             text = str(pkt.get("text", ""))
 
-            # определить "другую сторону" диалога
             other = sender if sender != self.username else to
             if not other:
                 return
@@ -318,15 +340,14 @@ class MessengerUI:
             key = self._dialog_key(other)
             self.history.setdefault(key, []).append((sender, text))
 
-            # если этот диалог сейчас открыт — перерисовать
             if self.active_chat == other:
                 self._render_active_dialog()
             else:
-                # можно потом добавить индикатор непрочитанных
-                pass
+                self.unread[other] = self.unread.get(other, 0) + 1
+                self._render_contacts()
 
         elif t == "dm_ack":
-            # можно позже рисовать галочку "доставлено"
+            # позже можно добавить "галочку доставлено"
             pass
 
         elif t == "system":
@@ -334,6 +355,9 @@ class MessengerUI:
 
         elif t == "error":
             self._chat_log("[error] " + str(pkt.get("text", "")))
+
+        elif t == "pong":
+            pass
 
     # ---------- send DM ----------
     def send_dm(self):
@@ -350,7 +374,7 @@ class MessengerUI:
 
         self.text_var.set("")
 
-        # сразу добавим к себе в историю (оптимистично)
+        # сразу добавим себе в историю (оптимистично)
         key = self._dialog_key(self.active_chat)
         self.history.setdefault(key, []).append((self.username, text))
         self._render_active_dialog()

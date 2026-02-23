@@ -60,45 +60,65 @@ def save_contacts(contacts: list[str]) -> None:
 
 class ChatServer:
     """
-    Сервер теперь поддерживает:
-    - общий список контактов из файла contacts.json
-    - online/offline presence
-    - личные сообщения (DM): клиент -> {"type":"dm","to":"Bob","text":"..."}
+    Сервер поддерживает:
+    - contacts.json (общий список контактов)
+    - presence online/offline
+    - личные сообщения (DM): {"type":"dm","to":"Bob","text":"..."}
     """
 
     def __init__(self, host="0.0.0.0", port=5050):
         self.host = host
         self.port = port
+
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        self.lock = threading.Lock()
+        # ВАЖНО: RLock чтобы не словить дедлок при вложенных вызовах
+        self.lock = threading.RLock()
 
         # sock -> username
         self.clients: dict[socket.socket, str] = {}
 
-        # username -> sock (удобно для DM)
+        # username -> sock
         self.user_to_sock: dict[str, socket.socket] = {}
 
+        # contacts list from file
         self.contacts: list[str] = load_contacts()
 
     def _online_set(self) -> set[str]:
         return set(self.user_to_sock.keys())
 
-    def broadcast(self, msg: dict, exclude: socket.socket | None = None):
-        dead = []
+    def _safe_send(self, sock: socket.socket, msg: dict) -> bool:
+        try:
+            send_packet(sock, msg)
+            return True
+        except OSError:
+            return False
+
+    def _broadcast(self, msg: dict, exclude: socket.socket | None = None):
+        """
+        Рассылка всем клиентам.
+        ВАЖНО: не держим lock во время сетевых sendall (чтобы не блокировать сервер).
+        """
         with self.lock:
-            for c in list(self.clients.keys()):
-                if exclude is not None and c is exclude:
-                    continue
-                try:
-                    send_packet(c, msg)
-                except OSError:
-                    dead.append(c)
-            for c in dead:
-                self._drop_client(c, announce=False)
+            targets = list(self.clients.keys())
+
+        dead: list[socket.socket] = []
+        for c in targets:
+            if exclude is not None and c is exclude:
+                continue
+            if not self._safe_send(c, msg):
+                dead.append(c)
+
+        if dead:
+            with self.lock:
+                for c in dead:
+                    self._drop_client(c, announce=False)
 
     def _drop_client(self, sock: socket.socket, announce: bool = True):
+        """
+        Удаление клиента (вызывается под lock или аккуратно).
+        """
         name = self.clients.get(sock)
 
         try:
@@ -113,50 +133,71 @@ class ChatServer:
             del self.user_to_sock[name]
 
         if announce and name:
-            self.broadcast({"type": "presence", "user": name, "online": False})
+            self._broadcast(
+                {"type": "presence", "user": name, "online": False})
 
-    def _ensure_contact_exists(self, name: str):
-        if name not in self.contacts:
-            self.contacts.append(name)
-            save_contacts(self.contacts)
+    def _ensure_contact_exists(self, name: str) -> bool:
+        """
+        Добавляем контакт в contacts.json, если он новый.
+        Возвращает True, если список изменился.
+        """
+        changed = False
+        with self.lock:
+            if name not in self.contacts:
+                self.contacts.append(name)
+                save_contacts(self.contacts)
+                changed = True
+        return changed
 
-        # всем сообщаем актуальный список контактов + онлайн
-        self.broadcast({
-            "type": "contacts",
-            "contacts": self.contacts,
-            "online": sorted(self._online_set())
-        })
+    def _send_contacts_snapshot_to(self, sock: socket.socket):
+        """
+        Отправляет подключившемуся актуальные contacts+online.
+        """
+        with self.lock:
+            contacts_snapshot = list(self.contacts)
+            online_snapshot = sorted(self._online_set())
+
+        self._safe_send(sock, {
+                        "type": "contacts", "contacts": contacts_snapshot, "online": online_snapshot})
+
+    def _broadcast_contacts_snapshot(self):
+        """
+        Рассылает всем актуальные contacts+online.
+        """
+        with self.lock:
+            contacts_snapshot = list(self.contacts)
+            online_snapshot = sorted(self._online_set())
+
+        self._broadcast(
+            {"type": "contacts", "contacts": contacts_snapshot, "online": online_snapshot})
 
     def _send_to_user(self, username: str, msg: dict) -> bool:
-        """
-        Отправить сообщение пользователю по имени.
-        Возвращает True если пользователь онлайн и отправка успешна.
-        """
-        sock = self.user_to_sock.get(username)
+        with self.lock:
+            sock = self.user_to_sock.get(username)
         if not sock:
             return False
-        try:
-            send_packet(sock, msg)
-            return True
-        except OSError:
-            return False
+        return self._safe_send(sock, msg)
 
     def handle_client(self, sock: socket.socket, addr):
+        name = None
         try:
             hello = recv_packet(sock)
             if hello.get("type") != "hello" or not hello.get("name"):
-                send_packet(sock, {"type": "error", "text": "Bad hello"})
+                self._safe_send(sock, {"type": "error", "text": "Bad hello"})
                 sock.close()
                 return
 
             name = str(hello["name"]).strip()[:32]
             if not name:
-                send_packet(sock, {"type": "error", "text": "Empty name"})
+                self._safe_send(sock, {"type": "error", "text": "Empty name"})
                 sock.close()
                 return
 
+            print(f"[connect] {name} from {addr}")
+
+            # зарегистрировать клиента
             with self.lock:
-                # Если такой ник уже онлайн — выкидываем старое соединение (простая политика)
+                # если ник уже онлайн — выкинуть старое соединение (простая политика)
                 old = self.user_to_sock.get(name)
                 if old and old is not sock:
                     self._drop_client(old, announce=False)
@@ -164,52 +205,52 @@ class ChatServer:
                 self.clients[sock] = name
                 self.user_to_sock[name] = sock
 
-                self._ensure_contact_exists(name)
+            # гарантируем, что ник есть в contacts.json
+            changed = self._ensure_contact_exists(name)
 
-                # подключившемуся — контакты и онлайн
-                send_packet(sock, {
-                    "type": "contacts",
-                    "contacts": self.contacts,
-                    "online": sorted(self._online_set()),
-                })
+            # подключившемуся — contacts + online
+            self._send_contacts_snapshot_to(sock)
 
             # всем — presence online
-            self.broadcast({"type": "presence", "user": name, "online": True})
+            self._broadcast({"type": "presence", "user": name, "online": True})
 
+            # если контакты обновились — всем разослать обновлённый список
+            if changed:
+                self._broadcast_contacts_snapshot()
+
+            # основной цикл
             while True:
                 pkt = recv_packet(sock)
                 t = pkt.get("type")
 
                 if t == "ping":
-                    send_packet(sock, {"type": "pong"})
+                    self._safe_send(sock, {"type": "pong"})
 
                 elif t == "dm":
                     to_user = str(pkt.get("to", "")).strip()[:32]
                     text = str(pkt.get("text", "")).strip()[:2000]
 
                     if not to_user or not text:
-                        send_packet(sock, {"type": "error", "text": "Bad dm"})
+                        self._safe_send(
+                            sock, {"type": "error", "text": "Bad dm"})
                         continue
 
-                    # сообщение для получателя
-                    delivered = False
-                    with self.lock:
-                        delivered = self._send_to_user(to_user, {
-                            "type": "dm",
-                            "from": name,
-                            "to": to_user,
-                            "text": text,
-                        })
+                    # доставить получателю
+                    delivered = self._send_to_user(
+                        to_user,
+                        {"type": "dm", "from": name, "to": to_user, "text": text},
+                    )
 
-                    # отправителю — ack/ошибка (заглушка)
+                    # ack / system
                     if delivered:
-                        send_packet(sock, {"type": "dm_ack", "to": to_user})
+                        self._safe_send(
+                            sock, {"type": "dm_ack", "to": to_user})
                     else:
-                        send_packet(sock, {
-                                    "type": "system", "text": f"{to_user} сейчас offline. Сообщение не доставлено."})
+                        self._safe_send(sock, {
+                                        "type": "system", "text": f"{to_user} сейчас offline. Сообщение не доставлено."})
 
                 else:
-                    send_packet(
+                    self._safe_send(
                         sock, {"type": "error", "text": "Unknown packet type"})
 
         except (ConnectionError, OSError, json.JSONDecodeError):
@@ -218,6 +259,8 @@ class ChatServer:
             with self.lock:
                 if sock in self.clients:
                     self._drop_client(sock, announce=True)
+            if name:
+                print(f"[disconnect] {name}")
 
     def serve_forever(self):
         self.server.bind((self.host, self.port))
