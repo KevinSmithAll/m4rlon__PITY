@@ -11,7 +11,7 @@ CONTACTS_FILE = "contacts.json"
 # ---------- protocol helpers ----------
 def send_packet(sock: socket.socket, obj: dict):
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    header = struct.pack("!I", len(data))  # 4 bytes, big-endian
+    header = struct.pack("!I", len(data))
     sock.sendall(header + data)
 
 
@@ -40,7 +40,6 @@ def load_contacts() -> list[str]:
         with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         contacts = data.get("contacts", [])
-        # нормализуем: только строки, без дублей, сохраняем порядок
         seen = set()
         out = []
         for x in contacts:
@@ -55,25 +54,21 @@ def load_contacts() -> list[str]:
 
 
 def save_contacts(contacts: list[str]) -> None:
-    data = {"contacts": contacts}
     with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump({"contacts": contacts}, f, ensure_ascii=False, indent=2)
 
 
 class ChatServer:
     """
-    Это уже не "общий чат".
-    Сервер сейчас делает только:
-    - хранит список контактов в contacts.json
-    - отслеживает, кто онлайн
-    - рассылает всем presence-события (онлайн/оффлайн)
-    - отправляет список контактов и текущий онлайн при подключении
+    Сервер теперь поддерживает:
+    - общий список контактов из файла contacts.json
+    - online/offline presence
+    - личные сообщения (DM): клиент -> {"type":"dm","to":"Bob","text":"..."}
     """
 
     def __init__(self, host="0.0.0.0", port=5050):
         self.host = host
         self.port = port
-
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -82,13 +77,13 @@ class ChatServer:
         # sock -> username
         self.clients: dict[socket.socket, str] = {}
 
-        # контакты общие для всех (из файла)
+        # username -> sock (удобно для DM)
+        self.user_to_sock: dict[str, socket.socket] = {}
+
         self.contacts: list[str] = load_contacts()
 
-    # ----- helpers -----
     def _online_set(self) -> set[str]:
-        # множество имён, которые сейчас онлайн
-        return set(self.clients.values())
+        return set(self.user_to_sock.keys())
 
     def broadcast(self, msg: dict, exclude: socket.socket | None = None):
         dead = []
@@ -105,6 +100,7 @@ class ChatServer:
 
     def _drop_client(self, sock: socket.socket, announce: bool = True):
         name = self.clients.get(sock)
+
         try:
             sock.close()
         except OSError:
@@ -113,24 +109,38 @@ class ChatServer:
         if sock in self.clients:
             del self.clients[sock]
 
-        # сообщаем всем, что пользователь оффлайн
+        if name and self.user_to_sock.get(name) is sock:
+            del self.user_to_sock[name]
+
         if announce and name:
             self.broadcast({"type": "presence", "user": name, "online": False})
 
     def _ensure_contact_exists(self, name: str):
-        """
-        Удобная "затычка":
-        если пользователь вошёл с новым ником, добавим его в общий файл,
-        чтобы он появился в контактах у всех.
-        """
         if name not in self.contacts:
             self.contacts.append(name)
             save_contacts(self.contacts)
-            # сообщим всем, что список контактов обновился
-            self.broadcast({"type": "contacts", "contacts": self.contacts,
-                           "online": sorted(self._online_set())})
 
-    # ----- client handler -----
+        # всем сообщаем актуальный список контактов + онлайн
+        self.broadcast({
+            "type": "contacts",
+            "contacts": self.contacts,
+            "online": sorted(self._online_set())
+        })
+
+    def _send_to_user(self, username: str, msg: dict) -> bool:
+        """
+        Отправить сообщение пользователю по имени.
+        Возвращает True если пользователь онлайн и отправка успешна.
+        """
+        sock = self.user_to_sock.get(username)
+        if not sock:
+            return False
+        try:
+            send_packet(sock, msg)
+            return True
+        except OSError:
+            return False
+
     def handle_client(self, sock: socket.socket, addr):
         try:
             hello = recv_packet(sock)
@@ -145,40 +155,59 @@ class ChatServer:
                 sock.close()
                 return
 
-            # 1) регистрируем клиента
             with self.lock:
-                self.clients[sock] = name
+                # Если такой ник уже онлайн — выкидываем старое соединение (простая политика)
+                old = self.user_to_sock.get(name)
+                if old and old is not sock:
+                    self._drop_client(old, announce=False)
 
-            # 2) гарантируем, что имя есть в contacts.json (для всех)
-            with self.lock:
+                self.clients[sock] = name
+                self.user_to_sock[name] = sock
+
                 self._ensure_contact_exists(name)
 
-            # 3) отправляем подключившемуся:
-            #    - список контактов
-            #    - кто онлайн прямо сейчас
-            with self.lock:
+                # подключившемуся — контакты и онлайн
                 send_packet(sock, {
                     "type": "contacts",
                     "contacts": self.contacts,
                     "online": sorted(self._online_set()),
                 })
 
-            # 4) всем рассылаем, что пользователь онлайн
-            self.broadcast({"type": "presence", "user": name,
-                           "online": True}, exclude=None)
+            # всем — presence online
+            self.broadcast({"type": "presence", "user": name, "online": True})
 
-            # 5) основной цикл: пока только пинг/понг
             while True:
                 pkt = recv_packet(sock)
                 t = pkt.get("type")
 
                 if t == "ping":
                     send_packet(sock, {"type": "pong"})
-                elif t == "msg":
-                    # сообщений пока нет (не общий чат)
-                    # можно вернуть заглушку
-                    send_packet(
-                        sock, {"type": "system", "text": "Личные сообщения ещё не реализованы."})
+
+                elif t == "dm":
+                    to_user = str(pkt.get("to", "")).strip()[:32]
+                    text = str(pkt.get("text", "")).strip()[:2000]
+
+                    if not to_user or not text:
+                        send_packet(sock, {"type": "error", "text": "Bad dm"})
+                        continue
+
+                    # сообщение для получателя
+                    delivered = False
+                    with self.lock:
+                        delivered = self._send_to_user(to_user, {
+                            "type": "dm",
+                            "from": name,
+                            "to": to_user,
+                            "text": text,
+                        })
+
+                    # отправителю — ack/ошибка (заглушка)
+                    if delivered:
+                        send_packet(sock, {"type": "dm_ack", "to": to_user})
+                    else:
+                        send_packet(sock, {
+                                    "type": "system", "text": f"{to_user} сейчас offline. Сообщение не доставлено."})
+
                 else:
                     send_packet(
                         sock, {"type": "error", "text": "Unknown packet type"})
@@ -194,13 +223,21 @@ class ChatServer:
         self.server.bind((self.host, self.port))
         self.server.listen(50)
         print(f"Server listening on {self.host}:{self.port}")
+
         try:
             while True:
-                sock, addr = self.server.accept()
+                try:
+                    sock, addr = self.server.accept()
+                except KeyboardInterrupt:
+                    print("\nServer stopped by Ctrl+C")
+                    break
                 threading.Thread(target=self.handle_client,
                                  args=(sock, addr), daemon=True).start()
         finally:
-            self.server.close()
+            try:
+                self.server.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

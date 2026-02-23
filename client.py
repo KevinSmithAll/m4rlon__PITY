@@ -44,26 +44,30 @@ class MessengerUI:
         self.sock = None
         self.running = False
 
-        # ВАЖНО: переменная имени пользователя (ник)
+        # Ник текущего пользователя
         self.username: str = ""
 
-        # Контакты и онлайн-статусы (затычка)
+        # Контакты + онлайн
         self.contacts: list[str] = []
         self.online: set[str] = set()
+
+        # Текущий выбранный собеседник
+        self.active_chat: str | None = None
+
+        # История сообщений по диалогам: key=frozenset({me, other}) -> list[tuple(sender,text)]
+        self.history: dict[frozenset[str], list[tuple[str, str]]] = {}
 
         if tb:
             self.root = tb.Window(themename="flatly")
         else:
             self.root = tk.Tk()
 
-        self.root.title("Socket Messenger (Contacts Stub)")
-        self.root.geometry("900x560")
+        self.root.title("Socket Messenger (DM)")
+        self.root.geometry("920x580")
         self.root.minsize(780, 480)
 
         self._build_login()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        # каждые 50ms читаем очередь событий от сети
         self.root.after(50, self._poll_incoming)
 
     # ---------- login UI ----------
@@ -103,14 +107,14 @@ class MessengerUI:
                         width=20, command=self.connect)
         btn.pack(pady=18)
 
-    # ---------- chat UI (now: contacts + system log) ----------
+    # ---------- main UI ----------
     def _build_main(self):
         self.login_frame.destroy()
 
         self.main = tk.Frame(self.root)
         self.main.pack(fill="both", expand=True)
 
-        # left panel: contacts
+        # left: contacts
         self.left = tk.Frame(self.main, width=280)
         self.left.pack(side="left", fill="y")
         self.left.pack_propagate(False)
@@ -118,17 +122,17 @@ class MessengerUI:
         tk.Label(self.left, text="Контакты", font=("Segoe UI", 14, "bold")).pack(
             anchor="w", padx=12, pady=(12, 6))
 
-        # Treeview удобнее для статуса online/offline
         self.contacts_view = ttk.Treeview(self.left, columns=(
             "status",), show="tree headings", height=18)
         self.contacts_view.heading("#0", text="Имя")
         self.contacts_view.heading("status", text="Статус")
         self.contacts_view.column("#0", width=160, anchor="w")
         self.contacts_view.column("status", width=80, anchor="center")
-
         self.contacts_view.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # right panel: system messages (log)
+        self.contacts_view.bind("<<TreeviewSelect>>", self._on_contact_select)
+
+        # right: chat
         self.right = tk.Frame(self.main)
         self.right.pack(side="right", fill="both", expand=True)
 
@@ -136,27 +140,28 @@ class MessengerUI:
         header.pack(fill="x")
 
         self.title_lbl = tk.Label(
-            header, text="Системные сообщения", font=("Segoe UI", 14, "bold"))
+            header, text="Выберите контакт", font=("Segoe UI", 14, "bold"))
         self.title_lbl.pack(side="left", padx=12, pady=10)
 
         self.status_lbl = tk.Label(
             header, text=f"Вы: {self.username}", fg="#666")
         self.status_lbl.pack(side="right", padx=12)
 
-        # log area (scrollable)
-        self.log_frame = tk.Frame(self.right)
-        self.log_frame.pack(fill="both", expand=True)
+        # messages (scrollable) using Text for simplicity
+        self.chat_frame = tk.Frame(self.right)
+        self.chat_frame.pack(fill="both", expand=True)
 
-        self.log_text = tk.Text(self.log_frame, wrap="word", state="disabled")
-        self.log_scroll = tk.Scrollbar(
-            self.log_frame, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=self.log_scroll.set)
+        self.chat_text = tk.Text(
+            self.chat_frame, wrap="word", state="disabled")
+        self.chat_scroll = tk.Scrollbar(
+            self.chat_frame, command=self.chat_text.yview)
+        self.chat_text.configure(yscrollcommand=self.chat_scroll.set)
 
-        self.log_text.pack(side="left", fill="both",
-                           expand=True, padx=(12, 0), pady=12)
-        self.log_scroll.pack(side="right", fill="y", padx=(0, 12), pady=12)
+        self.chat_text.pack(side="left", fill="both",
+                            expand=True, padx=(12, 0), pady=12)
+        self.chat_scroll.pack(side="right", fill="y", padx=(0, 12), pady=12)
 
-        # input area (disabled stub)
+        # input
         input_frame = tk.Frame(self.right)
         input_frame.pack(fill="x")
 
@@ -164,32 +169,60 @@ class MessengerUI:
         self.entry = tk.Entry(input_frame, textvariable=self.text_var)
         self.entry.pack(side="left", fill="x",
                         expand=True, padx=(12, 8), pady=12)
-        self.entry.bind("<Return>", lambda e: self.send_message_stub())
+        self.entry.bind("<Return>", lambda e: self.send_dm())
 
         self.send_btn = tk.Button(
-            input_frame, text="Отправить", width=12, command=self.send_message_stub)
+            input_frame, text="Отправить", width=12, command=self.send_dm)
         self.send_btn.pack(side="right", padx=(0, 12), pady=12)
 
-        self._log(
-            "Подключено. Загружены контакты (затычка). Личные сообщения пока не реализованы.")
+        self._chat_log("Подключено. Выберите контакт слева для диалога.")
 
-    # ---------- logging ----------
-    def _log(self, text: str):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", text + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    # ---------- chat helpers ----------
+    def _chat_log(self, text: str):
+        self.chat_text.configure(state="normal")
+        self.chat_text.insert("end", text + "\n")
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
+
+    def _dialog_key(self, other: str) -> frozenset[str]:
+        return frozenset({self.username, other})
+
+    def _render_active_dialog(self):
+        self.chat_text.configure(state="normal")
+        self.chat_text.delete("1.0", "end")
+
+        if not self.active_chat:
+            self.chat_text.insert("end", "Выберите контакт слева.\n")
+        else:
+            key = self._dialog_key(self.active_chat)
+            msgs = self.history.get(key, [])
+            for sender, text in msgs:
+                self.chat_text.insert("end", f"{sender}: {text}\n")
+
+        self.chat_text.see("end")
+        self.chat_text.configure(state="disabled")
 
     # ---------- contacts rendering ----------
     def _render_contacts(self):
-        # очистить текущее дерево
         for item in self.contacts_view.get_children():
             self.contacts_view.delete(item)
 
-        # отрисовать контакты
         for name in self.contacts:
+            if name == self.username:
+                continue  # себя не показываем в контактах
             status = "online" if name in self.online else "offline"
-            self.contacts_view.insert("", "end", text=name, values=(status,))
+            self.contacts_view.insert(
+                "", "end", iid=name, text=name, values=(status,))
+
+    def _on_contact_select(self, event):
+        sel = self.contacts_view.selection()
+        if not sel:
+            return
+        other = sel[0]
+        self.active_chat = other
+        self.title_lbl.config(text=f"Диалог: {other}")
+        self._render_active_dialog()
+        self.entry.focus_set()
 
     # ---------- connect / network ----------
     def connect(self):
@@ -216,7 +249,7 @@ class MessengerUI:
 
         self.sock = s
         self.running = True
-        self.username = name  # <-- ник клиента: считается онлайн на сервере
+        self.username = name
 
         self._build_main()
 
@@ -258,43 +291,75 @@ class MessengerUI:
         t = pkt.get("type")
 
         if t == "contacts":
-            # сервер прислал полный список контактов и кто онлайн сейчас
             self.contacts = list(pkt.get("contacts", []))
             self.online = set(pkt.get("online", []))
             self._render_contacts()
-            self._log(
-                f"Получен список контактов: {len(self.contacts)}; онлайн: {len(self.online)}")
 
         elif t == "presence":
-            # сервер сообщил: user стал online/offline
             user = pkt.get("user")
             online = bool(pkt.get("online"))
             if isinstance(user, str) and user:
                 if online:
                     self.online.add(user)
-                    self._log(f"{user} сейчас online")
                 else:
                     self.online.discard(user)
-                    self._log(f"{user} сейчас offline")
                 self._render_contacts()
 
-        elif t == "system":
-            self._log(str(pkt.get("text", "")))
+        elif t == "dm":
+            sender = str(pkt.get("from", "???"))
+            to = str(pkt.get("to", ""))
+            text = str(pkt.get("text", ""))
 
-        elif t == "error":
-            self._log("Ошибка: " + str(pkt.get("text", "")))
+            # определить "другую сторону" диалога
+            other = sender if sender != self.username else to
+            if not other:
+                return
 
-        elif t == "pong":
-            # можно не логировать
+            key = self._dialog_key(other)
+            self.history.setdefault(key, []).append((sender, text))
+
+            # если этот диалог сейчас открыт — перерисовать
+            if self.active_chat == other:
+                self._render_active_dialog()
+            else:
+                # можно потом добавить индикатор непрочитанных
+                pass
+
+        elif t == "dm_ack":
+            # можно позже рисовать галочку "доставлено"
             pass
 
-    # ---------- messaging stub ----------
-    def send_message_stub(self):
+        elif t == "system":
+            self._chat_log("[system] " + str(pkt.get("text", "")))
+
+        elif t == "error":
+            self._chat_log("[error] " + str(pkt.get("text", "")))
+
+    # ---------- send DM ----------
+    def send_dm(self):
+        if not self.running or not self.sock:
+            return
+
+        if not self.active_chat:
+            self._chat_log("[system] Сначала выберите контакт слева.")
+            return
+
         text = self.text_var.get().strip()
-        if text:
-            self.text_var.set("")
-        self._log(
-            "Затычка: личные сообщения ещё не реализованы. Сейчас есть только контакты и онлайн-статус.")
+        if not text:
+            return
+
+        self.text_var.set("")
+
+        # сразу добавим к себе в историю (оптимистично)
+        key = self._dialog_key(self.active_chat)
+        self.history.setdefault(key, []).append((self.username, text))
+        self._render_active_dialog()
+
+        try:
+            send_packet(self.sock, {"type": "dm",
+                        "to": self.active_chat, "text": text})
+        except OSError:
+            self._chat_log("[system] Не удалось отправить: нет соединения.")
 
     def on_close(self):
         self.running = False
